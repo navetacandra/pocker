@@ -1,0 +1,50 @@
+#!/bin/bash
+
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'; C='\033[0;36m'; NC='\033[0m'; BOLD='\033[1m'
+
+error() { echo -e "${R}[ERR]${NC}  $1"; exit 1; }
+
+banner() {
+    echo -e "${C}=================================${NC}"
+    echo -e "${C}   POCKER - Non Root Container   ${NC}"
+    echo -e "${C}=================================${NC}"
+}
+
+help() {
+    banner
+    echo -e ""
+    echo -e "Usage: $0 <command> <args...>"
+    echo -e "Commands:"
+    echo -e "  - ${BOLD}pull${NC} <image>[:tag]"
+    echo -e "  - ${BOLD}create${NC} <image> <container_name>"
+    echo -e "  - ${BOLD}login${NC} <container_name>"
+    echo -e "  - ${BOLD}delete${NC} <image>"
+    echo -e "  - ${BOLD}delete-container${NC} <container_name>"
+    exit 0
+}
+
+if [ $# -lt 2 ] || [ "$1" = "help" ]; then
+    help
+fi
+
+command="$1"
+case $command in
+    pull)
+        echo "Pulling image.."
+        ;;
+    create)
+        echo "Creating container.."
+        ;;
+    login)
+        echo "Login into container.."
+        ;;
+    delete)
+        echo "Delete image.."
+        ;;
+    "delete-container")
+        echo "Delete container.."
+        ;;
+    *)
+        help
+        ;;
+esac
