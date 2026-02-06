@@ -2,7 +2,7 @@
 
 **Pocker** is a lightweight, Bash-based container manager designed to run Linux distributions in a rootless environment. By leveraging `PRoot`, it allows users to pull Docker-compatible images and run them without requiring `sudo` or kernel-level container support (like namespaces).
 
-----
+---
 
 ## Features
 
@@ -12,7 +12,7 @@
 * **Clean Isolation:** Uses `PRoot` to guest-bind `/dev`, `/proc`, and `/sys`.
 * **Simplified CLI:** Easy commands for pulling, creating, and logging into containers.
 
-----
+---
 
 ## Prerequisites
 
@@ -22,7 +22,45 @@ Before running Pocker, ensure the following dependencies are installed on your h
 * `proot` (The core engine for rootless execution)
 * `tar`, `xz` (For extracting image layers)
 
-----
+---
+
+## Installation
+
+Choose the instruction set corresponding to your platform:
+
+### A. Debian / Ubuntu
+
+Open your terminal and run the following commands:
+
+```bash
+# 1. Update and Install Dependencies
+sudo apt update && sudo apt install git curl jq proot tar xz-utils -y
+
+# 2. Clone the Repository
+git clone git@github.com:navetacandra/pocker.git
+cd pocker
+
+# 3. Set Executable Permissions
+chmod +x pocker image_pull
+```
+
+### B. Termux (Android)
+
+Ensure your packages are up to date and install the requirements:
+
+```bash
+# 1. Update and Install Dependencies
+pkg update && pkg install git curl jq proot tar xz-utils -y
+
+# 2. Clone the Repository
+git clone git@github.com:navetacandra/pocker.git
+cd pocker
+
+# 3. Set Executable Permissions
+chmod +x pocker image_pull
+```
+
+---
 
 ## Usage Guide
 
@@ -59,14 +97,14 @@ Enter the container shell. Pocker will automatically detect `bash`, `ash`, or `s
 | `delete <image>` | Remove an image from the cache. |
 | `delete-container <name>` | Wipe a container instance's rootfs. |
 
-----
+---
 
 ## Directory Structure
 
 * `.cache/`: Stores the compressed image layers and manifests.
 * `.rootfs/`: Contains the extracted filesystems for your named containers.
 
-----
+---
 
 ## Important Notes
 
