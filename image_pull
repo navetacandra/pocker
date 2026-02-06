@@ -160,9 +160,9 @@ for layer in $LAYERS; do
         echo -e "Layer $COUNT/$TOTAL: $layer "
         curl -L -# -H "Authorization: Bearer $TOKEN" "$PROTOCOL$REGISTRY_HOST/v2/$REPO/blobs/$layer" -o "$OUTDIR/$FILENAME"
         if [ $? -eq 0 ]; then
-            echo -e "\r\033[2A${NL}\n${NL}\n\r\033[2ALayer $COUNT/$TOTAL: $layer ${G}[OK]${NC}"
+            echo -e "\r\033[2A${NL}\n${NL}\n\r\033[2A${NL}Layer $COUNT/$TOTAL: $layer ${G}[OK]${NC}"
         else
-            echo -e "\r\033[2A${NL}\n${NL}\n\r\033[2ALayer $COUNT/$TOTAL: $layer ${R}[FAIL]${NC}"
+            echo -e "\r\033[2A${NL}\n${NL}\n\r\033[2A${NL}Layer $COUNT/$TOTAL: $layer ${R}[FAIL]${NC}"
             exit 1
         fi
     fi
