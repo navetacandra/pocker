@@ -48,7 +48,15 @@ resolve_image_name() {
         [[ "$REPO_TAG" != *"/"* ]] && REPO_TAG="library/$REPO_TAG"
     fi
 
-    echo $REPO_TAG
+    if [[ "$REPO_TAG" == *":"* ]]; then
+        REPO=${REPO_TAG%%:*}
+        TAG=${REPO_TAG##*:}
+    else
+        REPO=$REPO_TAG
+        TAG="latest"
+    fi
+
+    echo "$REPO:$TAG"
 }
 
 alphanum() {
@@ -78,22 +86,27 @@ command="$1"
 case $command in
     pull)
         image="$2"
-        path="$(alphanum "$image")"
         full_image="$(resolve_image_name "$image")"
+        path="$(alphanum "$full_image")"
 
         if grep -q "^$full_image " "$CACHE_STATE"; then
             error "$image already installed."
         fi
 
-        echo "Pulling image.."
-        [ $? -eq 0 ] && printf "$full_image $path\n" >> "$CACHE_STATE"
+        mkdir -p "$CACHE_DIR/$path"
+        ./image_pull "$CACHE_DIR/$path" "$full_image"
+        if [ $? -eq 0 ]; then
+            printf "$full_image $path\n" >> "$CACHE_STATE"
+        else
+            rm -rf "$CACHE_DIR/$path"
+        fi
         ;;
     create)
         image="$2"
         container="$3"
-        image_path="$(alphanum "$image")"
-        full_image="$(resolve_image_name "$image")"
         container_path="$(alphanum "$container")"
+        full_image="$(resolve_image_name "$image")"
+        image_path="$(alphanum "$full_image")"
 
         if [ ! -e "$CACHE_DIR/$image_path" ] && ! grep -q "^$full_image" "$CACHE_STATE"; then
             error "$image is not installed."
@@ -122,8 +135,8 @@ case $command in
         ;;
     delete)
         image="$2"
-        path="$(alphanum "$image")"
         full_image="$(resolve_image_name "$image")"
+        path="$(alphanum "$full_image")"
         regex="^$(regsave "$full_image") "
         target="$CACHE_DIR/$path"
 
