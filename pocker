@@ -31,6 +31,7 @@ help() {
     echo -e ""
     echo -e "Usage: $0 <command> <args...>"
     echo -e "Commands:"
+    echo -e "  - ${BOLD}ls${NC} <container|image>"
     echo -e "  - ${BOLD}pull${NC} <image>[:tag]"
     echo -e "  - ${BOLD}create${NC} <image> <container_name>"
     echo -e "  - ${BOLD}login${NC} <container_name>"
@@ -92,6 +93,15 @@ layer_extract() {
     echo "nameserver 1.1.1.1" >> "$ROOTFS_DIR/$container_path/etc/resolv.conf"
     return 0
 }
+
+HAS_REQUIREMENT=0
+for cmd in git curl jq proot tar xz; do
+    if ! type $cmd > /dev/null 2>&1; then
+        echo -e "${R}[ERR]${NC} Missing deps: $cmd"
+        HAS_REQUIREMENT=1
+    fi
+done
+[ $HAS_REQUIREMENT -ne 0 ] && exit 1
 
 if [ $# -lt 2 ] || [ "$1" = "help" ]; then
     help
