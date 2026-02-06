@@ -89,7 +89,7 @@ layer_extract() {
             return 1
         fi
     done
-    echo "nameserver 1.1.1.1" > "$out/etc/resolv.conf"
+    echo "nameserver 1.1.1.1" >> "$ROOTFS_DIR/$container_path/etc/resolv.conf"
     return 0
 }
 
@@ -168,7 +168,35 @@ case $command in
         esac
         ;;
     login)
-        echo "Login into container.."
+        container="$2"
+        container_path="$(alphanum "$container")"
+        target="$ROOTFS_DIR/$container_path"
+
+        if [ ! -e "$target" ] || awk -F'\t' -v c="$container" '$2==c{found=1; exit} END{exit found}' "$ROOTFS_STATE" > /dev/null 2>&1; then
+            error "Container named '$container' is not exists."
+        fi
+
+        shell="/bin/sh"
+        if [ -f "$target/bin/bash" ]; then
+            shell="/bin/bash"
+        elif [ -f "$target/bin/ash" ]; then
+            shell="/bin/ash"
+        fi
+
+        env -i \
+            HOSTNAME="$container" \
+            PS1="\$(whoami)@\$HOSTNAME \w \$" \
+            HOME=/root \
+            TERM=xterm-256color \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            PROOT_NO_SECCOMP=1 \
+        proot -0 \
+            -r "$target" \
+            -b /dev \
+            -b /proc \
+            -b /sys \
+            -w /root \
+            $shell -lc 'exec '"$shell"' --login -c "export PS1=\"\\u@\$HOSTNAME \\w \\$ \"; exec '"$shell"'"'
         ;;
     delete)
         image="$2"
