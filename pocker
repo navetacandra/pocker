@@ -2,7 +2,7 @@
 set -uo pipefail
 IFS=$'\n\t'
 
-R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'; C='\033[0;36m'; NC='\033[0m'; BOLD='\033[1m'
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'; C='\033[0;36m'; NC='\033[0m'; BOLD='\033[1m'; NL='\r\033[K'
 
 error() { echo -e "${R}[ERR]${NC}  $1"; exit 1; }
 
@@ -67,6 +67,32 @@ regsave() {
     printf '%s\n' "$1" | sed -e 's/[][(){}.^$*+?|\\/]/\\&/g'
 }
 
+layer_extract() {
+    in="$1"
+    out="$2"
+    layers="$3"
+
+    for layer in $layers; do
+        [ ! -f "$in/$layer" ] && \
+            echo -e "${R}[ERR]${NC} Missing digest: $layer" && \
+            return 1
+
+        echo -ne "${Y}[WAIT]${NC} Extract $layer..."
+        if proot --link2symlink \
+            tar --no-same-owner \
+                --no-same-permissions \
+                -xpf "$in/$layer" \
+                -C "$out"; then
+            echo -e "${NL}Extract $layer ${G}[OK]${NC}"
+        else
+            echo -e "${NL}Extract $layer ${R}[FAIL]${NC}"
+            return 1
+        fi
+    done
+    echo "nameserver 1.1.1.1" > "$out/etc/resolv.conf"
+    return 0
+}
+
 if [ $# -lt 2 ] || [ "$1" = "help" ]; then
     help
 fi
@@ -113,10 +139,21 @@ case $command in
         fi
 
         if [ -e "$ROOTFS_DIR/$container_path" ] || awk -F'\t' -v c="$container" '$2==c{found=1; exit} END{exit !found}' "$ROOTFS_STATE" > /dev/null 2>&1; then
-            error "container named '$container' already exists."
+            error "Container named '$container' already exists."
         fi
 
-        echo "Creating container $image -> $container.."
+        [[ ! -e "$CACHE_DIR/$image_path" || ! -e "$CACHE_DIR/$image_path/manifest.json" ]] && \
+            error "Couldn't create container from '$image' because it might be corrupted."
+
+        mkdir -p "$ROOTFS_DIR/$container_path"
+        layer_extract "$CACHE_DIR/$image_path" "$ROOTFS_DIR/$container_path" "$(cat "$CACHE_DIR/$image_path/manifest.json" | jq -r .Layers[])"
+
+        if [ $? -eq 0 ]; then
+            echo -e "${G}[OK]${NC} Container '$container' successfully created."
+            echo -e "Use '${BOLD}$0 login $container${NC}' to enter container"
+        else
+            error "Failed create container"
+        fi
         printf "$full_image\t$container\t$container_path\n" >> "$ROOTFS_STATE"
         ;;
     ls)
