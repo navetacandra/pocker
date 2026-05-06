@@ -29,9 +29,10 @@ banner() {
 help() {
     banner
     echo -e ""
-    echo -e "Usage: $0 <command> <args...>"
+    echo -e "Usage: $(basename $0) <command> <args...>"
     echo -e "Commands:"
     echo -e "  - ${BOLD}ls${NC} <container|image>"
+    echo -e "  - ${BOLD}seach${NC} <image>"
     echo -e "  - ${BOLD}pull${NC} <image>[:tag]"
     echo -e "  - ${BOLD}create${NC} <image> <container_name>"
     echo -e "  - ${BOLD}login${NC} <container_name>"
@@ -122,6 +123,17 @@ ROOTFS_STATE="$ROOTFS_DIR/state"
 
 command="$1"
 case $command in
+    search)
+        image="$2"
+        results=$(curl -fsSL "https://hub.docker.com/search?q=$image" | grep -oP 'data-discover="true">\K[^<]+')
+        if [[ -z "$results" ]]; then
+            echo "Result is empty."
+        else
+            for img in $results; do
+                echo -e " ${G}-${NC} $img"
+            done
+        fi
+        ;;
     pull)
         image="$2"
         full_image="$(resolve_image_name "$image")"
@@ -132,7 +144,7 @@ case $command in
         fi
 
         mkdir -p "$CACHE_DIR/$path"
-        ./image_pull "$CACHE_DIR/$path" "$full_image"
+        $(cwd)/image_pull "$CACHE_DIR/$path" "$full_image"
         if [ $? -eq 0 ]; then
             printf "$full_image $path\n" >> "$CACHE_STATE"
         else
@@ -162,7 +174,7 @@ case $command in
 
         if [ $? -eq 0 ]; then
             echo -e "${G}[OK]${NC} Container '$container' successfully created."
-            echo -e "Use '${BOLD}$0 login $container${NC}' to enter container"
+            echo -e "Use '${BOLD}$(basename $0) login $container${NC}' to enter container"
         else
             error "Failed create container"
         fi
