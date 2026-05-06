@@ -91,7 +91,7 @@ layer_extract() {
         fi
     done
     echo "nameserver 1.1.1.1" >> "$ROOTFS_DIR/$container_path/etc/resolv.conf"
-    chown -R $USER:$USER "$ROOTFS_DIR/$container_path"
+    chown -R $(whoami):$(whoami) "$ROOTFS_DIR/$container_path"
     chmod u+w -R "$ROOTFS_DIR/$container_path"
     return 0
 }
