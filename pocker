@@ -31,13 +31,16 @@ help() {
     echo -e ""
     echo -e "Usage: $(basename $0) <command> <args...>"
     echo -e "Commands:"
-    echo -e "  - ${BOLD}ls${NC} <container|image>"
-    echo -e "  - ${BOLD}seach${NC} <image>"
-    echo -e "  - ${BOLD}pull${NC} <image>[:tag]"
-    echo -e "  - ${BOLD}create${NC} <image> <container_name>"
-    echo -e "  - ${BOLD}login${NC} <container_name>"
-    echo -e "  - ${BOLD}delete${NC} <image>"
-    echo -e "  - ${BOLD}delete-container${NC} <container_name>"
+    echo -e "  - ${BOLD}ls${NC}                                  List of created containers"
+    echo -e "    - ${BOLD}ls${NC} container                      List of created containers"
+    echo -e "    - ${BOLD}ls${NC} image                          List of downloaded images"
+    echo -e "  - ${BOLD}search${NC} <keyword>                    Search available images"
+    echo -e "  - ${BOLD}pull${NC} <image>[:tag]                  Download image(s)"
+    echo -e "  - ${BOLD}create${NC} <image> <container_name>     Create container"
+    echo -e "  - ${BOLD}login${NC} <container_name>              Enter container shell"
+    echo -e "  - ${BOLD}rm${NC} <container_name>                 Remove container(s)"
+    echo -e "    - ${BOLD}rm${NC} container <container_name>     Remove container(s)"
+    echo -e "    - ${BOLD}rm${NC} image <image>                  Remove image(s)"
     exit 0
 }
 
@@ -106,7 +109,7 @@ for cmd in git curl jq proot tar xz; do
 done
 [ $HAS_REQUIREMENT -ne 0 ] && exit 1
 
-if [ $# -lt 2 ] || [ "$1" = "help" ]; then
+if [ $# -lt 1 ] || [ "$1" = "help" ]; then
     help
 fi
 
@@ -120,6 +123,53 @@ ROOTFS_STATE="$ROOTFS_DIR/state"
 [ ! -f "$ROOTFS_STATE" ] && touch "$ROOTFS_STATE"
 [ ! -f "$CACHE_STATE" ] && touch "$CACHE_STATE"
 
+pull() {
+    image="$1"
+    full_image="$(resolve_image_name "$image")"
+    path="$(alphanum "$full_image")"
+
+    if grep -q "^$full_image " "$CACHE_STATE"; then
+        error "$image already installed."
+    fi
+
+    mkdir -p "$CACHE_DIR/$path"
+    $(cwd)/image_pull "$CACHE_DIR/$path" "$full_image"
+    if [ $? -eq 0 ]; then
+        printf "$full_image $path\n" >> "$CACHE_STATE"
+    else
+        rm -rf "$CACHE_DIR/$path"
+    fi
+}
+
+delete_image() {
+    image="$1"
+    full_image="$(resolve_image_name "$image")"
+    path="$(alphanum "$full_image")"
+    regex="^$(regsave "$full_image") "
+    target="$CACHE_DIR/$path"
+
+    if [ ! -e "$target" ] && ! grep -q "^$full_image " "$CACHE_STATE"; then
+        error "Image \"$image\" is not installed."
+    fi
+
+    rm -rf "$target"
+    sed -i "/$regex/d" "$CACHE_STATE"
+    echo -e "${G}[OK]${NC}  Image \"$image\" deleted."
+}
+
+delete_container() {
+    container="$1"
+    path="$(alphanum "$container")"
+    target="$ROOTFS_DIR/$path"
+
+    if [ ! -e "$target" ] && ! awk -F'\t' -v c="$container" '$2==c{found=1; exit} END{exit !found}' "$ROOTFS_STATE" > /dev/null 2>&1; then
+        error "Container \"$container\" is not found."
+    fi
+
+    rm -rf "$target"
+    sed -i "/\t$(regsave "$container")\t/d" "$ROOTFS_STATE"
+    echo -e "${G}[OK]${NC}  Container \"$container\" deleted."
+}
 
 command="$1"
 case $command in
@@ -135,21 +185,11 @@ case $command in
         fi
         ;;
     pull)
-        image="$2"
-        full_image="$(resolve_image_name "$image")"
-        path="$(alphanum "$full_image")"
-
-        if grep -q "^$full_image " "$CACHE_STATE"; then
-            error "$image already installed."
-        fi
-
-        mkdir -p "$CACHE_DIR/$path"
-        $(cwd)/image_pull "$CACHE_DIR/$path" "$full_image"
-        if [ $? -eq 0 ]; then
-            printf "$full_image $path\n" >> "$CACHE_STATE"
-        else
-            rm -rf "$CACHE_DIR/$path"
-        fi
+        shift 1
+        target=($@)
+        for img in "${target[@]}"; do
+            pull $img
+        done
         ;;
     create)
         image="$2"
@@ -181,12 +221,42 @@ case $command in
         printf "$full_image\t$container\t$container_path\n" >> "$ROOTFS_STATE"
         ;;
     ls)
-        case "$2" in
+        mode="container"
+        if [ $# -gt 1 ]; then
+            case "$2" in
+                image)
+                    mode="image"
+                    ;;
+                container)
+                    mode="container"
+                    ;;
+                *)
+                    mode=""
+                    ;;
+            esac
+        fi
+
+
+        case "$mode" in
             image)
-                cat "$CACHE_STATE" | awk '{print $1}'
+                result=$(cat "$CACHE_STATE" | awk '{print $1}')
+                if [ -z "$result" ]; then
+                    echo "No image downloaded."
+                else
+                    for r in $result; do
+                        echo -e " ${G}-${NC} $r"
+                    done
+                fi
                 ;;
             container)
-                awk '{ printf "%-8s | %s\n", $2, $1 }' "$ROOTFS_STATE"
+                result=$(awk '{ printf "%-8s | %s\n", $2, $1 }' "$ROOTFS_STATE")
+                if [ -z "$result" ]; then
+                    echo "No container created."
+                else
+                    for r in $result; do
+                        echo -e "$r"
+                    done
+                fi
                 ;;
             *) help;;
         esac
@@ -245,33 +315,29 @@ case $command in
 		umount "$target/sys"
 	fi
         ;;
-    delete)
-        image="$2"
-        full_image="$(resolve_image_name "$image")"
-        path="$(alphanum "$full_image")"
-        regex="^$(regsave "$full_image") "
-        target="$CACHE_DIR/$path"
-
-        if [ ! -e "$target" ] && ! grep -q "^$full_image " "$CACHE_STATE"; then
-            error "$image is not installed."
+    rm)
+        shift 1
+        mode="container"
+        target=($@)
+        if [ "$1" = "container" ]; then
+            shift 1
+            target=($@)
+        fi
+        if [ "$1" = "image" ]; then
+            shift 1
+            mode="image"
+            target=($@)
         fi
 
-        rm -rf "$target"
-        sed -i "/$regex/d" "$CACHE_STATE"
-        echo -e "${G}[OK]${NC}  $image deleted."
-        ;;
-    "delete-container")
-        container="$2"
-        path="$(alphanum "$container")"
-        target="$ROOTFS_DIR/$path"
-
-        if [ ! -e "$target" ] && ! awk -F'\t' -v c="$container" '$2==c{found=1; exit} END{exit !found}' "$ROOTFS_STATE" > /dev/null 2>&1; then
-            error "$container is not installed."
+        if [[ "$mode" == "container" ]]; then
+            for name in "${target[@]}"; do
+                delete_container $name
+            done
+        else
+            for name in "${target[@]}"; do
+                delete_image $name
+            done
         fi
-
-        rm -rf "$target"
-        sed -i "/\t$(regsave "$container")\t/d" "$ROOTFS_STATE"
-        echo -e "${G}[OK]${NC}  $container deleted."
         ;;
     *)
         help
