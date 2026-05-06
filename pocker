@@ -91,6 +91,8 @@ layer_extract() {
         fi
     done
     echo "nameserver 1.1.1.1" >> "$ROOTFS_DIR/$container_path/etc/resolv.conf"
+    chown -R $USER:$USER "$ROOTFS_DIR/$container_path"
+    chmod u+w -R "$ROOTFS_DIR/$container_path"
     return 0
 }
 
@@ -181,6 +183,7 @@ case $command in
         container="$2"
         container_path="$(alphanum "$container")"
         target="$ROOTFS_DIR/$container_path"
+        use_proot=1
 
         if [ ! -e "$target" ] || awk -F'\t' -v c="$container" '$2==c{found=1; exit} END{exit found}' "$ROOTFS_STATE" > /dev/null 2>&1; then
             error "Container named '$container' is not exists."
@@ -193,20 +196,42 @@ case $command in
             shell="/bin/ash"
         fi
 
-        env -i \
-            HOSTNAME="$container" \
-            PS1="\$(whoami)@\$HOSTNAME \w \$" \
-            HOME=/root \
-            TERM=xterm-256color \
-            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-            PROOT_NO_SECCOMP=1 \
-        proot -0 \
-            -r "$target" \
-            -b /dev \
-            -b /proc \
-            -b /sys \
-            -w /root \
-            $shell -lc 'exec '"$shell"' --login -c "export PS1=\"\\u@\$HOSTNAME \\w \\$ \"; exec '"$shell"'"'
+	if [[ $use_proot -eq 1 ]]; then
+		env -i \
+		    HOSTNAME="$container" \
+		    LANG=C.UTF-8 \
+		    PS1="\$(whoami)@\$HOSTNAME \w \$" \
+		    HOME=/root \
+		    TERM=xterm-256color \
+		    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+		    PROOT_NO_SECCOMP=1 \
+		proot -0 \
+		    --link2symlink \
+		    --kill-on-exit \
+		    -r "$target" \
+		    -b /dev \
+		    -b /proc \
+		    -b /sys \
+		    -w /root \
+		    $shell -lc 'exec '"$shell"' --login -c "export PS1=\"\\u@\\h \\w \\$ \"; exec '"$shell"'"'
+	else
+		mount --bind /dev  "$target/dev"
+		mount -t proc proc "$target/proc"
+		mount --bind /sys  "$target/sys"
+
+		env -i \
+		    HOSTNAME="$container" \
+		    PS1='\u@$HOSTNAME \w \$ ' \
+		    HOME=/root \
+		    TERM=xterm-256color \
+		    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+		    chroot "$target" \
+			$shell --login
+
+		umount "$target/dev"
+		umount "$target/proc"
+		umount "$target/sys"
+	fi
         ;;
     delete)
         image="$2"
