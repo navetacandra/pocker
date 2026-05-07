@@ -1,24 +1,27 @@
 #!/bin/bash
+
 set -uo pipefail
 IFS=$'\n\t'
 
-R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'; C='\033[0;36m'; NC='\033[0m'; BOLD='\033[1m'; NL='\r\033[K'
+# Source utilities
+LIB_DIR="$(dirname "$(readlink -f "$0")")/lib"
+if [[ -f "$LIB_DIR/utils.sh" ]]; then
+    source "$LIB_DIR/utils.sh"
+else
+    echo "[ERR] Cannot find $LIB_DIR/utils.sh"
+    exit 1
+fi
 
-error() { echo -e "${R}[ERR]${NC}  $1"; exit 1; }
+# Constants
+PROJECT_ROOT=$(get_cwd)
+CACHE_DIR="$PROJECT_ROOT/.cache"
+ROOTFS_DIR="$PROJECT_ROOT/.rootfs"
+CACHE_STATE="$CACHE_DIR/state"
+ROOTFS_STATE="$ROOTFS_DIR/state"
 
-cwd() {
-    source=${BASH_SOURCE[0]}
-    while [ -L "$source" ]; do
-        target="$(readlink "$source")"
-        if [[ $target == /* ]]; then
-            source="$target"
-        else
-            dir="$(dirname "$source")"
-            source="$dir/$target"
-        fi
-    done
-    dirname "$source"
-}
+# Ensure directories and state files exist
+mkdir -p "$CACHE_DIR" "$ROOTFS_DIR"
+touch "$CACHE_STATE" "$ROOTFS_STATE"
 
 banner() {
     echo -e "${C}=================================${NC}"
@@ -26,64 +29,61 @@ banner() {
     echo -e "${C}=================================${NC}"
 }
 
-help() {
+usage() {
     banner
     echo -e ""
-    echo -e "Usage: $(basename $0) <command> <args...>"
+    echo -e "Usage: $(basename "$0") <command> [args...]"
     echo -e "Commands:"
-    echo -e "  - ${BOLD}ls${NC}                                 List of created containers"
-    echo -e "    - ${BOLD}ls${NC} container                     List of created containers"
-    echo -e "    - ${BOLD}ls${NC} image                         List of downloaded images"
+    echo -e "  - ${BOLD}ls${NC} [container|image]               List containers or images"
     echo -e "  - ${BOLD}search${NC} <keyword>                   Search available images"
-    echo -e "  - ${BOLD}pull${NC} <image>[:tag]                 Download image(s)"
+    echo -e "  - ${BOLD}pull${NC} <image>[:tag]...              Download image(s)"
     echo -e "  - ${BOLD}create${NC} <image> <container_name>    Create container"
     echo -e "  - ${BOLD}login${NC} <container_name>             Enter container shell"
-    echo -e "  - ${BOLD}rm${NC} <container_name>                Remove container(s)"
-    echo -e "    - ${BOLD}rm${NC} container <container_name>    Remove container(s)"
-    echo -e "    - ${BOLD}rm${NC} image <image>                 Remove image(s)"
+    echo -e "  - ${BOLD}rm${NC} [container|image] <name>...     Remove container(s) or image(s)"
     exit 0
 }
 
-resolve_image_name() {
-    RAW_IMAGE="$1"
-    if [[ "$RAW_IMAGE" =~ ^([^/]+\.[^/]+)/(.+)$ ]]; then
-        REPO_TAG="${BASH_REMATCH[2]}"
-    else
-        REPO_TAG="$RAW_IMAGE"
-        [[ "$REPO_TAG" != *"/"* ]] && REPO_TAG="library/$REPO_TAG"
-    fi
+resolve_symlinks() {
+    local rootfs="$1"
+    echo -ne "${Y}[WAIT]${NC} Resolving symlinks..."
 
-    if [[ "$REPO_TAG" == *":"* ]]; then
-        REPO=${REPO_TAG%%:*}
-        TAG=${REPO_TAG##*:}
-    else
-        REPO=$REPO_TAG
-        TAG="latest"
-    fi
+    find "$rootfs" -type l | while read -r link; do
+        local target
+        target=$(readlink "$link")
 
-    echo "$REPO:$TAG"
-}
+        [[ "$target" != /* ]] && continue
 
-alphanum() {
-    echo "$1" | sed -e 's/[^a-zA-Z0-9]/_/g'
-}
+        local real="$rootfs$target"
 
-regsave() {
-    printf '%s\n' "$1" | sed -e 's/[][(){}.^$*+?|\\/]/\\&/g'
+        [[ ! -e "$real" ]] && continue
+        [[ -L "$real" ]] && continue
+
+        if [[ -d "$real" ]]; then
+            rm "$link"
+            mkdir -p "$link"
+            cp -a "$real/." "$link/"
+        elif [[ -f "$real" ]]; then
+            rm "$link"
+            cp -a "$real" "$link"
+        fi
+    done
+
+    echo -e "${NL}${G}[OK]${NC}  Symlinks resolved."
 }
 
 layer_extract() {
-    in="$1"
-    out="$2"
-    layers="$3"
+    local in="$1"
+    local out="$2"
+    local layers="$3"
 
     for layer in $layers; do
-        [ ! -f "$in/$layer" ] && \
-            echo -e "${R}[ERR]${NC} Missing digest: $layer" && \
+        if [[ ! -f "$in/$layer" ]]; then
+            echo -e "${R}[ERR]${NC} Missing digest: $layer"
             return 1
+        fi
 
         echo -ne "${Y}[WAIT]${NC} Extract $layer..."
-        if proot --link2symlink \
+        if proot \
             tar --no-same-owner \
                 --no-same-permissions \
                 -xpf "$in/$layer" \
@@ -93,253 +93,274 @@ layer_extract() {
             echo -e "${NL}Extract $layer ${R}[FAIL]${NC}"
             return 1
         fi
+
+        # Handle Docker whiteout files
+        find "$out" -name ".wh.*" | while read -r wh; do
+            local dir=$(dirname "$wh")
+            local base=$(basename "$wh" | sed 's/^\.wh\.//')
+
+            if [[ "$base" == ".wh..opq" ]]; then
+                rm -rf "${dir:?}"/*
+            else
+                rm -rf "$dir/$base"
+            fi
+            rm -f "$wh"
+        done
     done
-    echo "nameserver 1.1.1.1" >> "$ROOTFS_DIR/$container_path/etc/resolv.conf"
-    chown -R $(whoami):$(whoami) "$ROOTFS_DIR/$container_path"
-    chmod u+w -R "$ROOTFS_DIR/$container_path"
+
+    resolve_symlinks "$out"
+    echo "nameserver 1.1.1.1" >> "$out/etc/resolv.conf"
+    chown -R "$(whoami):$(whoami)" "$out"
+    chmod u+w -R "$out"
     return 0
 }
 
-HAS_REQUIREMENT=0
-for cmd in git curl jq proot tar xz; do
-    if ! type $cmd > /dev/null 2>&1; then
-        echo -e "${R}[ERR]${NC} Missing deps: $cmd"
-        HAS_REQUIREMENT=1
+patch_dnf() {
+    local target="$1"
+    if [[ -d "$target/etc/dnf" ]]; then
+        echo -ne "${Y}[WAIT]${NC} DNF sytem patch..."
+        cat <<EOF > "$target/etc/dnf/dnf.conf"
+[main]
+gpgcheck=0
+tsflags=nocontexts
+install_weak_deps=False
+EOF
+        PROOT_NO_SECCOMP=1 proot -0 \
+            --kill-on-exit \
+            -r "$target" \
+            -b /dev \
+            -b /proc \
+            -b /sys \
+            -w /root \
+            /bin/rpm --rebuilddb
+        echo -e "${NL}${G}[OK]${NC}  DNF sytem patched."
     fi
-done
-[ $HAS_REQUIREMENT -ne 0 ] && exit 1
+}
 
-if [ $# -lt 1 ] || [ "$1" = "help" ]; then
-    help
-fi
+patch_apt() {
+    local target="$1"
+    if [[ -d "$target/etc/apt" ]]; then
+        echo -ne "${Y}[WAIT]${NC} APT sytem patch..."
 
-CACHE_DIR="$(cwd)/.cache"
-ROOTFS_DIR="$(cwd)/.rootfs"
-CACHE_STATE="$CACHE_DIR/state"
-ROOTFS_STATE="$ROOTFS_DIR/state"
+        mkdir -p "$target/var/lib/dpkg"
+        touch "$target/var/lib/dpkg/status"
+        touch "$target/var/lib/dpkg/status-old"
+        touch "$target/var/lib/dpkg/available"
+        touch "$target/var/lib/dpkg/available-old"
 
-[ ! -e "$CACHE_DIR" ] && mkdir -p "$CACHE_DIR"
-[ ! -e "$ROOTFS_DIR" ] && mkdir -p "$ROOTFS_DIR"
-[ ! -f "$ROOTFS_STATE" ] && touch "$ROOTFS_STATE"
-[ ! -f "$CACHE_STATE" ] && touch "$CACHE_STATE"
+        local dpkg_real
+        if [[ -f "$target/usr/bin/dpkg" ]]; then
+            dpkg_real="/usr/bin/dpkg"
+        else
+            dpkg_real="/bin/dpkg"
+        fi
 
-pull() {
-    image="$1"
-    full_image="$(resolve_image_name "$image")"
-    path="$(alphanum "$full_image")"
+        cat > "$target/usr/local/bin/dpkg" <<EOF
+#!/bin/sh
+DPKG_DB="/var/lib/dpkg"
+[[ -f "\$DPKG_DB/status" ]] && cp -f "\$DPKG_DB/status" "\$DPKG_DB/status-old" 2>/dev/null
+[[ -f "\$DPKG_DB/available" ]] && cp -f "\$DPKG_DB/available" "\$DPKG_DB/available-old" 2>/dev/null
+exec /usr/bin/dpkg --force-unsafe-io --force-overwrite "\$@"
+EOF
+        chmod +x "$target/usr/local/bin/dpkg"
 
-    if grep -q "^$full_image " "$CACHE_STATE"; then
-        error "$image already installed."
+        cat > "$target/etc/apt/apt.conf.d/99pocker" <<'EOF'
+APT::Sandbox::User "root";
+Dpkg::Options { "--force-unsafe-io"; "--force-overwrite"; };
+Dir::Bin::dpkg "/usr/local/bin/dpkg";
+DPkg::Pre-Install-Pkgs { "/bin/true"; };
+DPkg::Tools::Options::/bin/true { Version "2"; };
+PackageManager::Configure "smart";
+DPkg::ConfigurePending "false";
+EOF
+        echo -e "${NL}${G}[OK]${NC}  APT sytem patched."
+    fi
+}
+
+cmd_pull() {
+    [[ $# -lt 1 ]] && error "Usage: pull <image>[:tag]..."
+    for image in "$@"; do
+        local full_image="$(resolve_image_name "$image")"
+        local path="$(alphanum "$full_image")"
+
+        if grep -q "^$full_image " "$CACHE_STATE"; then
+            echo -e "${Y}[WARN]${NC} $image already installed. Skipping."
+            continue
+        fi
+
+        mkdir -p "$CACHE_DIR/$path"
+        "$PROJECT_ROOT/image_pull" "$CACHE_DIR/$path" "$full_image"
+        if [[ $? -eq 0 ]]; then
+            printf "%s %s\n" "$full_image" "$path" >> "$CACHE_STATE"
+        else
+            rm -rf "$CACHE_DIR/$path"
+            error "Failed to pull $image"
+        fi
+    done
+}
+
+cmd_create() {
+    local image="$1"
+    local container="$2"
+    [[ -z "$image" || -z "$container" ]] && error "Usage: create <image> <container_name>"
+
+    local container_path="$(alphanum "$container")"
+    local full_image="$(resolve_image_name "$image")"
+    local image_path="$(alphanum "$full_image")"
+
+    if ! grep -q "^$full_image" "$CACHE_STATE"; then
+        error "$image is not installed. Run 'pull' first."
     fi
 
-    mkdir -p "$CACHE_DIR/$path"
-    $(cwd)/image_pull "$CACHE_DIR/$path" "$full_image"
-    if [ $? -eq 0 ]; then
-        printf "$full_image $path\n" >> "$CACHE_STATE"
+    if [[ -e "$ROOTFS_DIR/$container_path" ]] || awk -F'\t' -v c="$container" '$2==c{found=1; exit} END{exit !found}' "$ROOTFS_STATE" > /dev/null 2>&1; then
+        error "Container named '$container' already exists."
+    fi
+
+    if [[ ! -e "$CACHE_DIR/$image_path/manifest.json" ]]; then
+        error "Image '$image' data is corrupted or missing."
+    fi
+
+    mkdir -p "$ROOTFS_DIR/$container_path"
+    layer_extract "$CACHE_DIR/$image_path" "$ROOTFS_DIR/$container_path" "$(jq -r '.Layers[]' "$CACHE_DIR/$image_path/manifest.json")"
+
+    if [[ $? -eq 0 ]]; then
+        patch_dnf "$ROOTFS_DIR/$container_path"
+        patch_apt "$ROOTFS_DIR/$container_path"
+        echo -e "${G}[OK]${NC} Container '$container' successfully created."
+        echo -e "Use '${BOLD}$(basename "$0") login $container${NC}' to enter container"
+        printf "%s\t%s\t%s\n" "$full_image" "$container" "$container_path" >> "$ROOTFS_STATE"
     else
-        rm -rf "$CACHE_DIR/$path"
+        rm -rf "$ROOTFS_DIR/$container_path"
+        error "Failed to create container"
     fi
 }
 
-delete_image() {
-    image="$1"
-    full_image="$(resolve_image_name "$image")"
-    path="$(alphanum "$full_image")"
-    regex="^$(regsave "$full_image") "
-    target="$CACHE_DIR/$path"
+cmd_login() {
+    local container="$1"
+    [[ -z "$container" ]] && error "Usage: login <container_name>"
 
-    if [ ! -e "$target" ] && ! grep -q "^$full_image " "$CACHE_STATE"; then
-        error "Image \"$image\" is not installed."
+    local container_path="$(alphanum "$container")"
+    local target="$ROOTFS_DIR/$container_path"
+
+    if [[ ! -d "$target" ]]; then
+        error "Container named '$container' does not exist."
     fi
 
-    rm -rf "$target"
-    sed -i "/$regex/d" "$CACHE_STATE"
-    echo -e "${G}[OK]${NC}  Image \"$image\" deleted."
-}
-
-delete_container() {
-    container="$1"
-    path="$(alphanum "$container")"
-    target="$ROOTFS_DIR/$path"
-
-    if [ ! -e "$target" ] && ! awk -F'\t' -v c="$container" '$2==c{found=1; exit} END{exit !found}' "$ROOTFS_STATE" > /dev/null 2>&1; then
-        error "Container \"$container\" is not found."
+    local shell="/bin/sh"
+    if [[ -f "$target/bin/bash" ]]; then
+        shell="/bin/bash"
+    elif [[ -f "$target/bin/ash" ]]; then
+        shell="/bin/ash"
     fi
 
-    rm -rf "$target"
-    sed -i "/\t$(regsave "$container")\t/d" "$ROOTFS_STATE"
-    echo -e "${G}[OK]${NC}  Container \"$container\" deleted."
+    env -i \
+        HOSTNAME="$container" \
+        LANG=C.UTF-8 \
+        PS1="\$(whoami)@\$HOSTNAME \w \$" \
+        HOME=/root \
+        TERM="$TERM" \
+        PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+        PROOT_NO_SECCOMP=1 \
+        DEBIAN_FRONTEND=noninteractive \
+        DEBCONF_NONINTERACTIVE_SEEN=true \
+        DEBCONF_NOWARNINGS=yes \
+    proot -0 \
+        --kill-on-exit \
+        -r "$target" \
+        -b /dev:/dev \
+        -b /proc:/proc \
+        -b /sys:/sys \
+        -b /proc/self/loginuid:/proc/self/loginuid \
+        -w /root \
+        "$shell" -lc 'exec '"$shell"' --login -c "export PS1=\"\\u@\\h \\w \\$ \"; exec '"$shell"'"'
 }
+
+cmd_ls() {
+    local mode="${1:-container}"
+    case "$mode" in
+        image)
+            echo -e "${BOLD}Downloaded Images:${NC}"
+            if [[ ! -s "$CACHE_STATE" ]]; then
+                echo "  No images found."
+            else
+                awk '{print "  - " $1}' "$CACHE_STATE"
+            fi
+            ;;
+        container)
+            echo -e "${BOLD}Created Containers:${NC}"
+            if [[ ! -s "$ROOTFS_STATE" ]]; then
+                echo "  No containers found."
+            else
+                echo -e "  NAME     | IMAGE"
+                echo -e "  ---------|-------"
+                awk -F'\t' '{ printf "  %-8s | %s\n", $2, $1 }' "$ROOTFS_STATE"
+            fi
+            ;;
+        *)
+            usage
+            ;;
+    esac
+}
+
+cmd_rm() {
+    local mode="container"
+    if [[ "$1" == "image" || "$1" == "container" ]]; then
+        mode="$1"
+        shift
+    fi
+
+    [[ $# -lt 1 ]] && error "Usage: rm [container|image] <name>..."
+
+    for item in "$@"; do
+        if [[ "$mode" == "container" ]]; then
+            local container_path="$(alphanum "$item")"
+            local target="$ROOTFS_DIR/$container_path"
+            rm -rf "$target"
+            sed -i "/\t$(regsave "$item")\t/d" "$ROOTFS_STATE"
+            echo -e "${G}[OK]${NC} Container '$item' deleted."
+        else
+            local full_image="$(resolve_image_name "$item")"
+            local image_path="$(alphanum "$full_image")"
+            local target="$CACHE_DIR/$image_path"
+            rm -rf "$target"
+            sed -i "/^$(regsave "$full_image") /d" "$CACHE_STATE"
+            echo -e "${G}[OK]${NC} Image '$item' deleted."
+        fi
+    done
+}
+
+cmd_search() {
+    local keyword="$1"
+    [[ -z "$keyword" ]] && error "Usage: search <keyword>"
+
+    echo -ne "${Y}[WAIT]${NC} Searching Docker Hub..."
+    local results=$(curl -fsSL "https://hub.docker.com/search?q=$keyword" | grep -oP 'data-discover="true">\K[^<]+')
+    echo -e "${NL}${G}[OK]${NC} Results for '$keyword':"
+
+    if [[ -z "$results" ]]; then
+        echo "  No results found."
+    else
+        for img in $results; do
+            echo -e "  - $img"
+        done
+    fi
+}
+
+# Main
+check_deps git curl jq proot tar xz
+
+[[ $# -lt 1 ]] && usage
 
 command="$1"
-case $command in
-    search)
-        image="$2"
-        results=$(curl -fsSL "https://hub.docker.com/search?q=$image" | grep -oP 'data-discover="true">\K[^<]+')
-        if [[ -z "$results" ]]; then
-            echo "Result is empty."
-        else
-            for img in $results; do
-                echo -e " ${G}-${NC} $img"
-            done
-        fi
-        ;;
-    pull)
-        shift 1
-        target=($@)
-        for img in "${target[@]}"; do
-            pull $img
-        done
-        ;;
-    create)
-        image="$2"
-        container="$3"
-        container_path="$(alphanum "$container")"
-        full_image="$(resolve_image_name "$image")"
-        image_path="$(alphanum "$full_image")"
+shift
 
-        if [ ! -e "$CACHE_DIR/$image_path" ] && ! grep -q "^$full_image" "$CACHE_STATE"; then
-            error "$image is not installed."
-        fi
-
-        if [ -e "$ROOTFS_DIR/$container_path" ] || awk -F'\t' -v c="$container" '$2==c{found=1; exit} END{exit !found}' "$ROOTFS_STATE" > /dev/null 2>&1; then
-            error "Container named '$container' already exists."
-        fi
-
-        [[ ! -e "$CACHE_DIR/$image_path" || ! -e "$CACHE_DIR/$image_path/manifest.json" ]] && \
-            error "Couldn't create container from '$image' because it might be corrupted."
-
-        mkdir -p "$ROOTFS_DIR/$container_path"
-        layer_extract "$CACHE_DIR/$image_path" "$ROOTFS_DIR/$container_path" "$(cat "$CACHE_DIR/$image_path/manifest.json" | jq -r .Layers[])"
-
-        if [ $? -eq 0 ]; then
-            echo -e "${G}[OK]${NC} Container '$container' successfully created."
-            echo -e "Use '${BOLD}$(basename $0) login $container${NC}' to enter container"
-        else
-            error "Failed create container"
-        fi
-        printf "$full_image\t$container\t$container_path\n" >> "$ROOTFS_STATE"
-        ;;
-    ls)
-        mode="container"
-        if [ $# -gt 1 ]; then
-            case "$2" in
-                image)
-                    mode="image"
-                    ;;
-                container)
-                    mode="container"
-                    ;;
-                *)
-                    mode=""
-                    ;;
-            esac
-        fi
-
-
-        case "$mode" in
-            image)
-                result=$(cat "$CACHE_STATE" | awk '{print $1}')
-                if [ -z "$result" ]; then
-                    echo "No image downloaded."
-                else
-                    for r in $result; do
-                        echo -e " ${G}-${NC} $r"
-                    done
-                fi
-                ;;
-            container)
-                result=$(awk '{ printf "%-8s | %s\n", $2, $1 }' "$ROOTFS_STATE")
-                if [ -z "$result" ]; then
-                    echo "No container created."
-                else
-                    for r in $result; do
-                        echo -e "$r"
-                    done
-                fi
-                ;;
-            *) help;;
-        esac
-        ;;
-    login)
-        container="$2"
-        container_path="$(alphanum "$container")"
-        target="$ROOTFS_DIR/$container_path"
-        use_proot=1
-
-        if [ ! -e "$target" ] || awk -F'\t' -v c="$container" '$2==c{found=1; exit} END{exit found}' "$ROOTFS_STATE" > /dev/null 2>&1; then
-            error "Container named '$container' is not exists."
-        fi
-
-        shell="/bin/sh"
-        if [ -f "$target/bin/bash" ]; then
-            shell="/bin/bash"
-        elif [ -f "$target/bin/ash" ]; then
-            shell="/bin/ash"
-        fi
-
-	if [[ $use_proot -eq 1 ]]; then
-		env -i \
-		    HOSTNAME="$container" \
-		    LANG=C.UTF-8 \
-		    PS1="\$(whoami)@\$HOSTNAME \w \$" \
-		    HOME=/root \
-		    TERM=xterm-256color \
-		    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-		    PROOT_NO_SECCOMP=1 \
-		proot -0 \
-		    --link2symlink \
-		    --kill-on-exit \
-		    -r "$target" \
-		    -b /dev \
-		    -b /proc \
-		    -b /sys \
-		    -w /root \
-		    $shell -lc 'exec '"$shell"' --login -c "export PS1=\"\\u@\\h \\w \\$ \"; exec '"$shell"'"'
-	else
-		mount --bind /dev  "$target/dev"
-		mount -t proc proc "$target/proc"
-		mount --bind /sys  "$target/sys"
-
-		env -i \
-		    HOSTNAME="$container" \
-		    PS1='\u@$HOSTNAME \w \$ ' \
-		    HOME=/root \
-		    TERM=xterm-256color \
-		    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-		    chroot "$target" \
-			$shell --login
-
-		umount "$target/dev"
-		umount "$target/proc"
-		umount "$target/sys"
-	fi
-        ;;
-    rm)
-        shift 1
-        mode="container"
-        target=($@)
-        if [ "$1" = "container" ]; then
-            shift 1
-            target=($@)
-        fi
-        if [ "$1" = "image" ]; then
-            shift 1
-            mode="image"
-            target=($@)
-        fi
-
-        if [[ "$mode" == "container" ]]; then
-            for name in "${target[@]}"; do
-                delete_container $name
-            done
-        else
-            for name in "${target[@]}"; do
-                delete_image $name
-            done
-        fi
-        ;;
-    *)
-        help
-        ;;
+case "$command" in
+    pull)   cmd_pull "$@" ;;
+    create) cmd_create "$@" ;;
+    login)  cmd_login "$@" ;;
+    ls)     cmd_ls "$@" ;;
+    rm)     cmd_rm "$@" ;;
+    search) cmd_search "$@" ;;
+    help)   usage ;;
+    *)      usage ;;
 esac

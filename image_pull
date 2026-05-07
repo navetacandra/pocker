@@ -1,150 +1,125 @@
 #!/bin/bash
+
 set -uo pipefail
 
-R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'; C='\033[0;36m'; NC='\033[0m'; BOLD='\033[1m'; NL='\r\033[K'
-ACCEPT_HEADER="Accept: application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json"
+# Source utilities
+LIB_DIR="$(dirname "$(readlink -f "$0")")/lib"
+if [[ -f "$LIB_DIR/utils.sh" ]]; then
+    source "$LIB_DIR/utils.sh"
+else
+    echo "[ERR] Cannot find $LIB_DIR/utils.sh"
+    exit 1
+fi
 
-error() { echo -e "${R}[ERR]${NC}  $1"; exit 1; }
+ACCEPT_HEADER="Accept: application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json"
 
 get_target_arch() {
     if type uname > /dev/null 2>&1; then
-		uArch="$(uname -m)"
-		case "${uArch}" in
-			x86_64)
-				echo amd64
-				return 0
-				;;
-			arm | armv[0-9]*)
-				echo arm
-				return 0
-				;;
-			aarch64)
-				echo arm64
-				return 0
-				;;
-			mips*)
-				echo >&2 "I see you are running on mips but I don't know how to determine endianness yet, so I cannot select a correct arch to fetch."
-				echo >&2 "Consider installing \"go\" on the system which I can use to determine the correct arch or specify it explicitly by setting TARGETARCH"
-				exit 1
-				;;
-			*)
-				echo "${uArch}"
-				return 0
-				;;
-		esac
-
-	fi
-
-	# default value
-	echo amd64
+        local uArch="$(uname -m)"
+        case "${uArch}" in
+            x86_64)  echo amd64 ;;
+            arm|armv[0-9]*) echo arm ;;
+            aarch64) echo arm64 ;;
+            *)       echo "${uArch}" ;;
+        esac
+        return 0
+    fi
+    echo amd64
 }
 
-curl_show_progress() {
-    local url=$1
-    local out=$2
+# Main execution
+OUTDIR="${1:-}"
+RAW_IMAGE="${2:-}"
+[[ -z "$OUTDIR" || -z "$RAW_IMAGE" ]] && error "Usage: image_pull <out_dir> <image> [arch]"
 
-    curl -L "$url" -o "$out" \
-        --progress-bar \
-        2>&1 | while IFS= read -r line; do
-            printf "\r\033[K%s" "$line"
-        done
-    echo
-}
+ARCH="${3:-$(get_target_arch)}"
 
-OUTDIR="$1"
-RAW_IMAGE="$2"
-ARCH=""
-REALM=""
-SERVICE=""
+REGISTRY_HOST="registry-1.docker.io"
+REPO_TAG="$RAW_IMAGE"
+PROTOCOL="https://"
 
-[ $# -ge 3 ] && ARCH="$3"
-[ -z "$ARCH" ] && ARCH="$(get_target_arch)"
-
-# Resolve Registry Host
 if [[ "$RAW_IMAGE" =~ ^([^/]+\.[^/]+)/(.+)$ ]]; then
-    # Custom Registry (GCR, GHCR, Quay, Private)
     REGISTRY_HOST="${BASH_REMATCH[1]}"
     REPO_TAG="${BASH_REMATCH[2]}"
-    PROTOCOL="https://"
-else
-    # Default: Docker Hub
-    REGISTRY_HOST="registry-1.docker.io"
-    REPO_TAG="$RAW_IMAGE"
-    PROTOCOL="https://"
-
-    [[ "$REPO_TAG" != *"/"* ]] && REPO_TAG="library/$REPO_TAG"
 fi
 
-# Tag Split
 if [[ "$REPO_TAG" == *":"* ]]; then
     REPO=${REPO_TAG%%:*}
     TAG=${REPO_TAG##*:}
 else
-    REPO=$REPO_TAG
+    REPO="$REPO_TAG"
     TAG="latest"
 fi
 
+[[ "$REGISTRY_HOST" == "registry-1.docker.io" && "$REPO" != *"/"* ]] && REPO="library/$REPO"
+
 echo -e "Target   : ${BOLD}$REGISTRY_HOST/$REPO:$TAG${NC} ($ARCH)"
 
-# REALM
+# Discover Auth Endpoint
 echo -ne "${Y}[....]${NC} Discovering Auth Endpoint..."
-AUTH_CHALLENGE="$(curl -s -I "$PROTOCOL$REGISTRY_HOST/v2/" | grep -i "www-authenticate")"
+AUTH_CHALLENGE="$(curl -s -I "$PROTOCOL$REGISTRY_HOST/v2/" | grep -i "www-authenticate" || true)"
+REALM=""
+SERVICE=""
+
 [[ "$AUTH_CHALLENGE" =~ realm=\"([^\"]+)\" ]] && REALM="${BASH_REMATCH[1]}"
 [[ "$AUTH_CHALLENGE" =~ service=\"([^\"]+)\" ]] && SERVICE="${BASH_REMATCH[1]}"
 
-# Set for hub.docker.com
-[ -z "$REALM" ] && [ "$REGISTRY_HOST" == "registry-1.docker.io" ] && \
-    REALM="https://auth.docker.io/token" && \
-    SERVICE="registry.docker.io"
-# Set for other service
-[ -z "$SERVICE" ] && SERVICE=$REGISTRY_HOST
-echo -e "${NL}${G}[OK]${NC}   Auth Realm: $(echo $REALM | cut -d/ -f3)"
+if [[ -z "$REALM" ]]; then
+    if [[ "$REGISTRY_HOST" == "registry-1.docker.io" ]]; then
+        REALM="https://auth.docker.io/token"
+        SERVICE="registry.docker.io"
+    else
+        SERVICE="$REGISTRY_HOST"
+    fi
+fi
+echo -e "${NL}${G}[OK]${NC}   Auth Realm: $(echo "$REALM" | cut -d/ -f3)"
 
-# TOKEN
+# Authenticate
 echo -ne "${Y}[....]${NC} Authenticating..."
 TOKEN_URL="$REALM?service=$SERVICE&scope=repository:$REPO:pull"
-TOKEN=$(curl -s "$TOKEN_URL" | jq -r .token)
+TOKEN_RESPONSE=$(curl -s "$TOKEN_URL")
+TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.token // .access_token')
 
-[[ -z "$TOKEN" || "$TOKEN" = "null" ]] && TOKEN=$(curl -s "$TOKEN_URL" | jq -r .access_token)
-[[ -z "$TOKEN" || "$TOKEN" = "null" ]] && echo "" && error "Auth Failed. Server response:\n$(curl -s "$TOKEN_URL")"
+if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+    echo ""
+    error "Auth Failed. Server response:\n$TOKEN_RESPONSE"
+fi
 echo -e "${NL}${G}[OK]${NC}   Authenticated."
 
-# MANIFEST
+# Fetch Manifest
 echo -ne "${Y}[....]${NC} Fetching Manifest..."
 MANIFEST_URL="$PROTOCOL$REGISTRY_HOST/v2/$REPO/manifests/$TAG"
 MANIFEST=$(curl -s -H "Authorization: Bearer $TOKEN" -H "$ACCEPT_HEADER" "$MANIFEST_URL")
 
-# MANIFEST ERROR
-echo "$MANIFEST" | grep -q "errors" && error "Registry Error: $MANIFEST"
+if echo "$MANIFEST" | grep -q "errors"; then
+    error "Registry Error: $MANIFEST"
+fi
 
-MEDIA_TYPE="$(echo "$MANIFEST" | jq -r .mediaType)"
+MEDIA_TYPE="$(echo "$MANIFEST" | jq -r '.mediaType // empty')"
 
-# Multi Arch
+# Handle Multi-Arch
 if [[ "$MEDIA_TYPE" == *"list"* || "$MEDIA_TYPE" == *"index"* ]]; then
     echo -e "${NL}${Y}[WAIT]${NC} List detected. Fetching for ${BOLD}$ARCH${NC}..."
-
     DIGEST=$(echo "$MANIFEST" | jq -r --arg arch "$ARCH" '.manifests[] | select(.platform.architecture == $arch) | .digest')
-    if [ -z "$DIGEST" ] || [ "$DIGEST" == "null" ]; then
+    
+    if [[ -z "$DIGEST" || "$DIGEST" == "null" ]]; then
         error "Architecture $ARCH not found."
     fi
 
-    # Resolve match arch
     MANIFEST=$(curl -s -H "Authorization: Bearer $TOKEN" -H "$ACCEPT_HEADER" "$PROTOCOL$REGISTRY_HOST/v2/$REPO/manifests/$DIGEST")
 fi
-
 echo -e "${NL}${G}[OK]${NC}   Manifest Validated."
-# echo "$MANIFEST" > "manifest.json"
 
-# GET CONFIG
-CONFIG_DIGEST=$(echo "$MANIFEST" | jq -r .config.digest)
+# Fetch Config
+CONFIG_DIGEST=$(echo "$MANIFEST" | jq -r '.config.digest')
 echo -ne "${Y}[....]${NC} Fetching Config..."
 curl -L -s -H "Authorization: Bearer $TOKEN" "$PROTOCOL$REGISTRY_HOST/v2/$REPO/blobs/$CONFIG_DIGEST" -o "$OUTDIR/$CONFIG_DIGEST.json"
 
-# WRITE MANIFEST
+# Write formatted manifest for pocker
 echo "[$MANIFEST]" | jq --arg config "$OUTDIR/$CONFIG_DIGEST.json" --arg tag "$REPO:$TAG" '.[0] | {Config: $config, RepoTags: [$tag], Layers: [.layers[].digest]}' > "$OUTDIR/manifest.json"
 echo -e "${NL}${G}[OK]${NC}   Config saved."
 
-# DOWNLOAD LAYERS
+# Download Layers
 LAYERS=$(echo "$MANIFEST" | jq -r '.layers[].digest')
 COUNT=0
 TOTAL=$(echo "$MANIFEST" | jq '.layers | length')
@@ -152,14 +127,11 @@ TOTAL=$(echo "$MANIFEST" | jq '.layers | length')
 echo "-------------------------------------------------"
 for layer in $LAYERS; do
     ((COUNT++))
-    FILENAME="$layer"
-
-    if [ -f "$OUTDIR/$FILENAME" ]; then
+    if [[ -f "$OUTDIR/$layer" ]]; then
         echo -e "Layer $COUNT/$TOTAL: $layer ${G}[Cached]${NC}"
     else
         echo -e "Layer $COUNT/$TOTAL: $layer "
-        curl -L -# -H "Authorization: Bearer $TOKEN" "$PROTOCOL$REGISTRY_HOST/v2/$REPO/blobs/$layer" -o "$OUTDIR/$FILENAME"
-        if [ $? -eq 0 ]; then
+        if curl -L -# -H "Authorization: Bearer $TOKEN" "$PROTOCOL$REGISTRY_HOST/v2/$REPO/blobs/$layer" -o "$OUTDIR/$layer"; then
             echo -e "\r\033[2A${NL}\n${NL}\n\r\033[2A${NL}Layer $COUNT/$TOTAL: $layer ${G}[OK]${NC}"
         else
             echo -e "\r\033[2A${NL}\n${NL}\n\r\033[2A${NL}Layer $COUNT/$TOTAL: $layer ${R}[FAIL]${NC}"
