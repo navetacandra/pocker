@@ -45,30 +45,50 @@ usage() {
 
 resolve_symlinks() {
     local rootfs="$1"
-    echo -ne "${Y}[WAIT]${NC} Resolving symlinks..."
+    echo -ne "${Y}[WAIT]${NC} Resolving symlinks (l2s)..."
 
-    find "$rootfs" -type l | while read -r link; do
-        local target
-        target=$(readlink "$link")
+    # 1. Convert .l2s metadata files to real symlinks
+    # proot --link2symlink can create .l2s files containing the target path
+    find "$rootfs" -name "*.l2s" | while read -r l2s; do
+        [[ ! -f "$l2s" ]] && continue
+        local link_path="${l2s%.l2s}"
+        local link_target
+        link_target=$(cat "$l2s" 2>/dev/null)
 
-        [[ "$target" != /* ]] && continue
+        # Hapus file .l2s yang "merusak" (metadata)
+        rm -f "$l2s"
 
-        local real="$rootfs$target"
-
-        [[ ! -e "$real" ]] && continue
-        [[ -L "$real" ]] && continue
-
-        if [[ -d "$real" ]]; then
-            rm "$link"
-            mkdir -p "$link"
-            cp -a "$real/." "$link/"
-        elif [[ -f "$real" ]]; then
-            rm "$link"
-            cp -a "$real" "$link"
+        if [[ -n "$link_target" ]]; then
+            # Hapus path target jika ada file/dir yang menghalangi
+            rm -rf "$link_path"
+            ln -sf "$link_target" "$link_path" 2>/dev/null
         fi
     done
 
-    echo -e "${NL}${G}[OK]${NC}  Symlinks resolved."
+    # 2. Flatten absolute symlinks to ensure portability
+    find "$rootfs" -type l | while read -r link; do
+        local target
+        target=$(readlink "$link")
+        [[ -z "$target" ]] && continue
+
+        # We only flatten absolute symlinks (pointing to /...)
+        # because they break when the rootfs is used without proot -r
+        [[ "$target" != /* ]] && continue
+
+        local real="$rootfs$target"
+        [[ ! -e "$real" || -L "$real" ]] && continue
+
+        if [[ -d "$real" ]]; then
+            rm -f "$link"
+            mkdir -p "$link"
+            cp -a "$real/." "$link/" 2>/dev/null
+        elif [[ -f "$real" ]]; then
+            rm -f "$link"
+            cp -a "$real" "$link" 2>/dev/null
+        fi
+    done
+
+    echo -e "${NL}${G}[OK]${NC} Symlinks (l2s) resolved."
 }
 
 layer_extract() {
@@ -83,7 +103,7 @@ layer_extract() {
         fi
 
         echo -ne "${Y}[WAIT]${NC} Extract $layer..."
-        if proot \
+        if proot --link2symlink \
             tar --no-same-owner \
                 --no-same-permissions \
                 -xpf "$in/$layer" \
@@ -109,7 +129,12 @@ layer_extract() {
     done
 
     resolve_symlinks "$out"
-    echo "nameserver 1.1.1.1" >> "$out/etc/resolv.conf"
+    echo "nameserver 1.1.1.1" > "$out/etc/resolv.conf"
+    cat > "$out/etc/hosts" <<EOF
+127.0.0.1   localhost
+::1         localhost ip6-localhost ip6-loopback
+EOF
+
     chown -R "$(whoami):$(whoami)" "$out"
     chmod u+w -R "$out"
     return 0
@@ -118,7 +143,7 @@ layer_extract() {
 patch_dnf() {
     local target="$1"
     if [[ -d "$target/etc/dnf" ]]; then
-        echo -ne "${Y}[WAIT]${NC} DNF sytem patch..."
+        echo "RPM based image patch.."
         cat <<EOF > "$target/etc/dnf/dnf.conf"
 [main]
 gpgcheck=0
@@ -131,16 +156,16 @@ EOF
             -b /dev \
             -b /proc \
             -b /sys \
+            -b /tmp \
             -w /root \
             /bin/rpm --rebuilddb
-        echo -e "${NL}${G}[OK]${NC}  DNF sytem patched."
     fi
 }
 
 patch_apt() {
     local target="$1"
     if [[ -d "$target/etc/apt" ]]; then
-        echo -ne "${Y}[WAIT]${NC} APT sytem patch..."
+        echo -ne "${Y}[WAIT]${NC} APT system patch..."
 
         mkdir -p "$target/var/lib/dpkg"
         touch "$target/var/lib/dpkg/status"
@@ -158,22 +183,28 @@ patch_apt() {
         cat > "$target/usr/local/bin/dpkg" <<EOF
 #!/bin/sh
 DPKG_DB="/var/lib/dpkg"
-[[ -f "\$DPKG_DB/status" ]] && cp -f "\$DPKG_DB/status" "\$DPKG_DB/status-old" 2>/dev/null
-[[ -f "\$DPKG_DB/available" ]] && cp -f "\$DPKG_DB/available" "\$DPKG_DB/available-old" 2>/dev/null
-exec /usr/bin/dpkg --force-unsafe-io --force-overwrite "\$@"
+[ -f "\$DPKG_DB/status" ] && cp -f "\$DPKG_DB/status" "\$DPKG_DB/status-old" 2>/dev/null
+[ -f "\$DPKG_DB/available" ] && cp -f "\$DPKG_DB/available" "\$DPKG_DB/available-old" 2>/dev/null
+exec $dpkg_real --force-unsafe-io --force-overwrite "\$@"
 EOF
         chmod +x "$target/usr/local/bin/dpkg"
 
         cat > "$target/etc/apt/apt.conf.d/99pocker" <<'EOF'
 APT::Sandbox::User "root";
 Dpkg::Options { "--force-unsafe-io"; "--force-overwrite"; };
+Dpkg::Use-Pty "0";
 Dir::Bin::dpkg "/usr/local/bin/dpkg";
 DPkg::Pre-Install-Pkgs { "/bin/true"; };
 DPkg::Tools::Options::/bin/true { Version "2"; };
 PackageManager::Configure "smart";
 DPkg::ConfigurePending "false";
 EOF
-        echo -e "${NL}${G}[OK]${NC}  APT sytem patched."
+
+        # Pre-install cdebconf to avoid debconf-related failures in PRoot
+        PROOT_NO_SECCOMP=1 proot -0 -r "$target" -b /dev -b /proc -b /sys -b /tmp /usr/bin/apt-get update >/dev/null 2>&1
+        PROOT_NO_SECCOMP=1 proot -0 -r "$target" -b /dev -b /proc -b /sys -b /tmp /usr/bin/apt-get install -y cdebconf >/dev/null 2>&1 || true
+
+        echo -e "${NL}${G}[OK]${NC} APT system patched."
     fi
 }
 
@@ -270,6 +301,7 @@ cmd_login() {
         -b /dev:/dev \
         -b /proc:/proc \
         -b /sys:/sys \
+        -b /tmp:/tmp \
         -b /proc/self/loginuid:/proc/self/loginuid \
         -w /root \
         "$shell" -lc 'exec '"$shell"' --login -c "export PS1=\"\\u@\\h \\w \\$ \"; exec '"$shell"'"'
