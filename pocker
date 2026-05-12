@@ -18,10 +18,23 @@ CACHE_DIR="$PROJECT_ROOT/.cache"
 ROOTFS_DIR="$PROJECT_ROOT/.rootfs"
 CACHE_STATE="$CACHE_DIR/state"
 ROOTFS_STATE="$ROOTFS_DIR/state"
+MOUNTS=()
 
 # Ensure directories and state files exist
 mkdir -p "$CACHE_DIR" "$ROOTFS_DIR"
 touch "$CACHE_STATE" "$ROOTFS_STATE"
+
+cleanup_mounts() {
+    if [[ ${#MOUNTS[@]} -gt 0 ]]; then
+        #echo -ne "${Y}[WAIT]${NC} Cleaning up mounts..."
+        # Unmount in reverse order
+        for ((i=${#MOUNTS[@]}-1; i>=0; i--)); do
+            umount -l "${MOUNTS[$i]}" 2>/dev/null || true
+        done
+        #echo -e "${G}[OK]${NC}"
+    fi
+}
+trap cleanup_mounts EXIT
 
 banner() {
     echo -e "${C}=================================${NC}"
@@ -39,6 +52,7 @@ usage() {
     echo -e "  - ${BOLD}pull${NC} <image>[:tag]...              Download image(s)"
     echo -e "  - ${BOLD}create${NC} <image> <container_name>    Create container"
     echo -e "  - ${BOLD}login${NC} [--chroot] [-v src:target] <container_name>  Enter container shell"
+    echo -e "  - ${BOLD}use${NC} [--chroot] [-v src:target] [--command=\"cmd\"] <container_name>  Execute command"
     echo -e "  - ${BOLD}rm${NC} [container|image] <name>...     Remove container(s) or image(s)"
     exit 0
 }
@@ -299,14 +313,12 @@ cmd_login() {
         # Ensure system directories exist for mounting
         mkdir -p "$target/dev" "$target/proc" "$target/sys" "$target/tmp"
 
-        # List of mounts to cleanup
-        local mounts=("$target/dev" "$target/proc" "$target/sys" "$target/tmp")
-
         # Mount system directories
         mount --bind /dev "$target/dev"
         mount --bind /proc "$target/proc"
         mount --bind /sys "$target/sys"
         mount --bind /tmp "$target/tmp"
+        MOUNTS+=("$target/dev" "$target/proc" "$target/sys" "$target/tmp")
 
         # Mount custom volumes
         for vol in "${volumes[@]}"; do
@@ -324,19 +336,8 @@ cmd_login() {
             local container_dest="${dest#/}"
             mkdir -p "$target/$container_dest"
             mount --bind "$src" "$target/$container_dest"
-            mounts+=("$target/$container_dest")
+            MOUNTS+=("$target/$container_dest")
         done
-
-        # Cleanup function
-        cleanup() {
-            echo -ne "${Y}[WAIT]${NC} Cleaning up mounts..."
-            # Unmount in reverse order
-            for ((i=${#mounts[@]}-1; i>=0; i--)); do
-                umount -l "${mounts[$i]}" 2>/dev/null || true
-            done
-            echo -e "${G}[OK]${NC}"
-        }
-        trap cleanup EXIT
 
         env -i \
             HOSTNAME="$container" \
@@ -380,6 +381,96 @@ cmd_login() {
             DEBCONF_NOWARNINGS=yes \
         proot "${proot_args[@]}" \
             "$shell" -lc 'exec '"$shell"' --login -c "export PS1=\"\\u@\\h \\w \\$ \"; exec '"$shell"'"'
+    fi
+}
+
+cmd_use() {
+    local use_chroot=false
+    local container=""
+    local volumes=()
+    local exec_cmd=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --chroot) use_chroot=true; shift ;;
+            -v) shift; volumes+=("$1"); shift ;;
+            --command=*) exec_cmd="${1#*=}"; shift ;;
+            --command) shift; exec_cmd="$1"; shift ;;
+            *)
+                if [[ -z "$container" ]]; then
+                    container="$1"
+                    shift
+                else
+                    # If no --command flag, the rest of the arguments are the command
+                    [[ -z "$exec_cmd" ]] && exec_cmd="$*"
+                    break
+                fi
+                ;;
+        esac
+    done
+
+    [[ -z "$container" || -z "$exec_cmd" ]] && error "Usage: use [--chroot] [-v src:target] [--command=\"cmd\"] <container_name>"
+
+    local container_path="$(alphanum "$container")"
+    local target="$ROOTFS_DIR/$container_path"
+
+    if [[ ! -d "$target" ]]; then
+        error "Container named '$container' does not exist."
+    fi
+
+    # Prepare command execution array
+    local run_args=()
+    if [[ -n "$exec_cmd" ]]; then
+        run_args=("/bin/sh" "-c" "$exec_cmd")
+    fi
+
+    if [[ "$use_chroot" == "true" ]]; then
+        mkdir -p "$target/dev" "$target/proc" "$target/sys" "$target/tmp"
+
+        mount --bind /dev "$target/dev"
+        mount --bind /proc "$target/proc"
+        mount --bind /sys "$target/sys"
+        mount --bind /tmp "$target/tmp"
+        MOUNTS+=("$target/dev" "$target/proc" "$target/sys" "$target/tmp")
+
+        for vol in "${volumes[@]}"; do
+            local src="${vol%%:*}"
+            local dest="${vol#*:}"
+            [[ "$vol" != *":"* ]] && dest="$src"
+            local container_dest="${dest#/}"
+            mkdir -p "$target/$container_dest"
+            mount --bind "$src" "$target/$container_dest"
+            MOUNTS+=("$target/$container_dest")
+        done
+
+        env -i \
+            HOSTNAME="$container" \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            DEBIAN_FRONTEND=noninteractive \
+            chroot "$target" "${run_args[@]}"
+    else
+        local proot_args=(
+            -0
+            --kill-on-exit
+            -r "$target"
+            -b /dev:/dev
+            -b /proc:/proc
+            -b /sys:/sys
+            -b /tmp:/tmp
+            -b /proc/self/loginuid:/proc/self/loginuid
+            -w /root
+        )
+
+        for vol in "${volumes[@]}"; do
+            proot_args+=("-b" "$vol")
+        done
+
+        env -i \
+            HOSTNAME="$container" \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            PROOT_NO_SECCOMP=1 \
+            DEBIAN_FRONTEND=noninteractive \
+        proot "${proot_args[@]}" "${run_args[@]}"
     fi
 }
 
@@ -466,6 +557,7 @@ case "$command" in
     pull)   cmd_pull "$@" ;;
     create) cmd_create "$@" ;;
     login)  cmd_login "$@" ;;
+    use)    cmd_use "$@" ;;
     ls)     cmd_ls "$@" ;;
     rm)     cmd_rm "$@" ;;
     search) cmd_search "$@" ;;
