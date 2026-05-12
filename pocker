@@ -38,7 +38,7 @@ usage() {
     echo -e "  - ${BOLD}search${NC} <keyword>                   Search available images"
     echo -e "  - ${BOLD}pull${NC} <image>[:tag]...              Download image(s)"
     echo -e "  - ${BOLD}create${NC} <image> <container_name>    Create container"
-    echo -e "  - ${BOLD}login${NC} [--chroot] <container_name>  Enter container shell"
+    echo -e "  - ${BOLD}login${NC} [--chroot] [-v src:target] <container_name>  Enter container shell"
     echo -e "  - ${BOLD}rm${NC} [container|image] <name>...     Remove container(s) or image(s)"
     exit 0
 }
@@ -269,15 +269,17 @@ cmd_create() {
 cmd_login() {
     local use_chroot=false
     local container=""
+    local volumes=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --chroot) use_chroot=true; shift ;;
+            -v) shift; volumes+=("$1"); shift ;;
             *) container="$1"; shift ;;
         esac
     done
 
-    [[ -z "$container" ]] && error "Usage: login [--chroot] <container_name>"
+    [[ -z "$container" ]] && error "Usage: login [--chroot] [-v src:target] <container_name>"
 
     local container_path="$(alphanum "$container")"
     local target="$ROOTFS_DIR/$container_path"
@@ -294,6 +296,48 @@ cmd_login() {
     fi
 
     if [[ "$use_chroot" == "true" ]]; then
+        # Ensure system directories exist for mounting
+        mkdir -p "$target/dev" "$target/proc" "$target/sys" "$target/tmp"
+
+        # List of mounts to cleanup
+        local mounts=("$target/dev" "$target/proc" "$target/sys" "$target/tmp")
+
+        # Mount system directories
+        mount --bind /dev "$target/dev"
+        mount --bind /proc "$target/proc"
+        mount --bind /sys "$target/sys"
+        mount --bind /tmp "$target/tmp"
+
+        # Mount custom volumes
+        for vol in "${volumes[@]}"; do
+            local src="${vol%%:*}"
+            local dest="${vol#*:}"
+            [[ "$src" == "$dest" ]] && dest="${src}" # Handle case where no : is present
+            
+            # If no colon was provided, dest will be equal to src. 
+            # But we want dest to be relative to rootfs.
+            if [[ "$vol" != *":"* ]]; then
+                dest="$src"
+            fi
+            
+            # Ensure dest is absolute within container for mkdir, but remove leading slash for host path
+            local container_dest="${dest#/}"
+            mkdir -p "$target/$container_dest"
+            mount --bind "$src" "$target/$container_dest"
+            mounts+=("$target/$container_dest")
+        done
+
+        # Cleanup function
+        cleanup() {
+            echo -ne "${Y}[WAIT]${NC} Cleaning up mounts..."
+            # Unmount in reverse order
+            for ((i=${#mounts[@]}-1; i>=0; i--)); do
+                umount -l "${mounts[$i]}" 2>/dev/null || true
+            done
+            echo -e "${G}[OK]${NC}"
+        }
+        trap cleanup EXIT
+
         env -i \
             HOSTNAME="$container" \
             LANG=C.UTF-8 \
@@ -307,6 +351,22 @@ cmd_login() {
         chroot "$target" \
             "$shell" -lc 'exec '"$shell"' --login -c "export PS1=\"\\u@\\h \\w \\$ \"; exec '"$shell"'"'
     else
+        local proot_args=(
+            -0
+            --kill-on-exit
+            -r "$target"
+            -b /dev:/dev
+            -b /proc:/proc
+            -b /sys:/sys
+            -b /tmp:/tmp
+            -b /proc/self/loginuid:/proc/self/loginuid
+            -w /root
+        )
+
+        for vol in "${volumes[@]}"; do
+            proot_args+=("-b" "$vol")
+        done
+
         env -i \
             HOSTNAME="$container" \
             LANG=C.UTF-8 \
@@ -318,15 +378,7 @@ cmd_login() {
             DEBIAN_FRONTEND=noninteractive \
             DEBCONF_NONINTERACTIVE_SEEN=true \
             DEBCONF_NOWARNINGS=yes \
-        proot -0 \
-            --kill-on-exit \
-            -r "$target" \
-            -b /dev:/dev \
-            -b /proc:/proc \
-            -b /sys:/sys \
-            -b /tmp:/tmp \
-            -b /proc/self/loginuid:/proc/self/loginuid \
-            -w /root \
+        proot "${proot_args[@]}" \
             "$shell" -lc 'exec '"$shell"' --login -c "export PS1=\"\\u@\\h \\w \\$ \"; exec '"$shell"'"'
     fi
 }
