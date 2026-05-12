@@ -38,7 +38,7 @@ usage() {
     echo -e "  - ${BOLD}search${NC} <keyword>                   Search available images"
     echo -e "  - ${BOLD}pull${NC} <image>[:tag]...              Download image(s)"
     echo -e "  - ${BOLD}create${NC} <image> <container_name>    Create container"
-    echo -e "  - ${BOLD}login${NC} <container_name>             Enter container shell"
+    echo -e "  - ${BOLD}login${NC} [--chroot] <container_name>  Enter container shell"
     echo -e "  - ${BOLD}rm${NC} [container|image] <name>...     Remove container(s) or image(s)"
     exit 0
 }
@@ -267,8 +267,17 @@ cmd_create() {
 }
 
 cmd_login() {
-    local container="$1"
-    [[ -z "$container" ]] && error "Usage: login <container_name>"
+    local use_chroot=false
+    local container=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --chroot) use_chroot=true; shift ;;
+            *) container="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$container" ]] && error "Usage: login [--chroot] <container_name>"
 
     local container_path="$(alphanum "$container")"
     local target="$ROOTFS_DIR/$container_path"
@@ -284,27 +293,42 @@ cmd_login() {
         shell="/bin/ash"
     fi
 
-    env -i \
-        HOSTNAME="$container" \
-        LANG=C.UTF-8 \
-        PS1="\$(whoami)@\$HOSTNAME \w \$" \
-        HOME=/root \
-        TERM="$TERM" \
-        PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-        PROOT_NO_SECCOMP=1 \
-        DEBIAN_FRONTEND=noninteractive \
-        DEBCONF_NONINTERACTIVE_SEEN=true \
-        DEBCONF_NOWARNINGS=yes \
-    proot -0 \
-        --kill-on-exit \
-        -r "$target" \
-        -b /dev:/dev \
-        -b /proc:/proc \
-        -b /sys:/sys \
-        -b /tmp:/tmp \
-        -b /proc/self/loginuid:/proc/self/loginuid \
-        -w /root \
-        "$shell" -lc 'exec '"$shell"' --login -c "export PS1=\"\\u@\\h \\w \\$ \"; exec '"$shell"'"'
+    if [[ "$use_chroot" == "true" ]]; then
+        env -i \
+            HOSTNAME="$container" \
+            LANG=C.UTF-8 \
+            PS1="\$(whoami)@\$HOSTNAME \w \$" \
+            HOME=/root \
+            TERM="$TERM" \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            DEBIAN_FRONTEND=noninteractive \
+            DEBCONF_NONINTERACTIVE_SEEN=true \
+            DEBCONF_NOWARNINGS=yes \
+        chroot "$target" \
+            "$shell" -lc 'exec '"$shell"' --login -c "export PS1=\"\\u@\\h \\w \\$ \"; exec '"$shell"'"'
+    else
+        env -i \
+            HOSTNAME="$container" \
+            LANG=C.UTF-8 \
+            PS1="\$(whoami)@\$HOSTNAME \w \$" \
+            HOME=/root \
+            TERM="$TERM" \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            PROOT_NO_SECCOMP=1 \
+            DEBIAN_FRONTEND=noninteractive \
+            DEBCONF_NONINTERACTIVE_SEEN=true \
+            DEBCONF_NOWARNINGS=yes \
+        proot -0 \
+            --kill-on-exit \
+            -r "$target" \
+            -b /dev:/dev \
+            -b /proc:/proc \
+            -b /sys:/sys \
+            -b /tmp:/tmp \
+            -b /proc/self/loginuid:/proc/self/loginuid \
+            -w /root \
+            "$shell" -lc 'exec '"$shell"' --login -c "export PS1=\"\\u@\\h \\w \\$ \"; exec '"$shell"'"'
+    fi
 }
 
 cmd_ls() {
@@ -379,7 +403,7 @@ cmd_search() {
 }
 
 # Main
-check_deps git curl jq proot tar xz
+check_deps git curl jq proot tar xz chroot
 
 [[ $# -lt 1 ]] && usage
 
